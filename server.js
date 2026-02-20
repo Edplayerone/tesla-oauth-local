@@ -475,85 +475,92 @@ app.get("/vehicle/:vid/stop", async (req, res) => {
   }
 });
 
+// ============================================================================
+// Live Snapshot Helper (shared by debug + rule engine)
+// ============================================================================
+
+async function buildLiveSnapshot({ requestedVid, requestedSiteId }) {
+  const [vehicles, sites] = await Promise.all([
+    teslaApi.getVehicles(),
+    teslaApi.getEnergySites(),
+  ]);
+
+  if (!vehicles.length) {
+    throw new Error("No vehicles found for this account.");
+  }
+
+  if (!sites.length) {
+    throw new Error("No energy sites with resource_type=battery found for this account.");
+  }
+
+  const vehicle =
+    (requestedVid &&
+      vehicles.find(
+        (v) => String(v.id) === String(requestedVid) || String(v.vin) === String(requestedVid)
+      )) ||
+    vehicles[0];
+
+  const site =
+    (requestedSiteId &&
+      sites.find(
+        (s) =>
+          String(s.id) === String(requestedSiteId) ||
+          String(s.energy_site_id) === String(requestedSiteId)
+      )) ||
+    sites[0];
+
+  const [energyLive, vehicleInfo] = await Promise.all([
+    teslaApi.getEnergyLiveStatus(site.energy_site_id),
+    teslaApi.getVehicleDataJson(vehicle.id),
+  ]);
+
+  const vehicleUnavailable =
+    vehicleInfo && typeof vehicleInfo === "object" && "_unavailable" in vehicleInfo
+      ? vehicleInfo._unavailable
+      : null;
+
+  const chargeState =
+    !vehicleUnavailable && vehicleInfo && typeof vehicleInfo === "object"
+      ? vehicleInfo.charge_state || {}
+      : {};
+
+  return {
+    vehicle: {
+      id: vehicle.id,
+      vin: vehicle.vin,
+      display_name: vehicle.display_name,
+      unavailable: vehicleUnavailable,
+    },
+    energy_site: {
+      id: site.id,
+      energy_site_id: site.energy_site_id,
+      site_name: site.site_name,
+    },
+    metrics: {
+      soc: chargeState.battery_level ?? null,
+      solar_power: energyLive?.solar_power ?? null,
+      load_power: energyLive?.load_power ?? null,
+      battery_power: energyLive?.battery_power ?? null,
+      grid_power: energyLive?.grid_power ?? null,
+      percentage_charged: energyLive?.percentage_charged ?? null,
+      charging_state: chargeState.charging_state ?? null,
+      charger_power: chargeState.charger_power ?? null,
+      charger_actual_current: chargeState.charger_actual_current ?? null,
+      charger_voltage: chargeState.charger_voltage ?? null,
+    },
+  };
+}
+
 app.get("/debug/live", async (req, res) => {
   if (!teslaApi.tokens) {
     return res.status(401).json({ error: "Not authenticated. Visit / to login with Tesla first." });
   }
 
   try {
-    const [vehicles, sites] = await Promise.all([
-      teslaApi.getVehicles(),
-      teslaApi.getEnergySites(),
-    ]);
-
-    if (!vehicles.length) {
-      return res.status(400).json({ error: "No vehicles found for this account." });
-    }
-
-    if (!sites.length) {
-      return res
-        .status(400)
-        .json({ error: "No energy sites with resource_type=battery found for this account." });
-    }
-
     const requestedVid = req.query.vid || req.query.vehicleId;
     const requestedSiteId = req.query.siteId || req.query.energy_site_id;
 
-    const vehicle =
-      (requestedVid &&
-        vehicles.find((v) => String(v.id) === String(requestedVid) || String(v.vin) === String(requestedVid))) ||
-      vehicles[0];
-
-    const site =
-      (requestedSiteId &&
-        sites.find(
-          (s) =>
-            String(s.id) === String(requestedSiteId) ||
-            String(s.energy_site_id) === String(requestedSiteId)
-        )) ||
-      sites[0];
-
-    const [energyLive, vehicleInfo] = await Promise.all([
-      teslaApi.getEnergyLiveStatus(site.energy_site_id),
-      teslaApi.getVehicleDataJson(vehicle.id),
-    ]);
-
-    const vehicleUnavailable =
-      vehicleInfo && typeof vehicleInfo === "object" && "_unavailable" in vehicleInfo
-        ? vehicleInfo._unavailable
-        : null;
-
-    const chargeState =
-      !vehicleUnavailable && vehicleInfo && typeof vehicleInfo === "object"
-        ? vehicleInfo.charge_state || {}
-        : {};
-
-    const snapshot = {
-      vehicle: {
-        id: vehicle.id,
-        vin: vehicle.vin,
-        display_name: vehicle.display_name,
-        unavailable: vehicleUnavailable,
-      },
-      energy_site: {
-        id: site.id,
-        energy_site_id: site.energy_site_id,
-        site_name: site.site_name,
-      },
-      metrics: {
-        soc: chargeState.battery_level ?? null,
-        solar_power: energyLive?.solar_power ?? null,
-        load_power: energyLive?.load_power ?? null,
-        battery_power: energyLive?.battery_power ?? null,
-        grid_power: energyLive?.grid_power ?? null,
-        percentage_charged: energyLive?.percentage_charged ?? null,
-        charging_state: chargeState.charging_state ?? null,
-        charger_power: chargeState.charger_power ?? null,
-        charger_actual_current: chargeState.charger_actual_current ?? null,
-        charger_voltage: chargeState.charger_voltage ?? null,
-      },
-    };
-
+    const snapshot = await buildLiveSnapshot({ requestedVid, requestedSiteId });
     res.json(snapshot);
   } catch (e) {
     res.status(500).json({ error: String(e) });
@@ -589,6 +596,197 @@ app.get("/vehicle/:vid/set_amps/:amps", async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// ============================================================================
+// SOC + TOU Rule Engine
+// ============================================================================
+
+const RULE_DEFAULTS = {
+  reserveOffPeak: 40,
+  reservePeak: 70,
+  peakStartHour: 16,
+  peakEndHour: 21,
+  minAmps: 5,
+  maxAmps: 32,
+  minSurplusWatts: 500,
+  voltage: 240,
+};
+
+function currentReserveSoc(now = new Date(), options = {}) {
+  const cfg = { ...RULE_DEFAULTS, ...options };
+  const hour = now.getHours();
+  const inPeak = hour >= cfg.peakStartHour && hour < cfg.peakEndHour;
+  return inPeak ? cfg.reservePeak : cfg.reserveOffPeak;
+}
+
+function wattsToAmps(surplusW, voltage) {
+  if (!Number.isFinite(surplusW) || !Number.isFinite(voltage) || voltage <= 0) {
+    return 0;
+  }
+  return surplusW / voltage;
+}
+
+function decideChargingActionFromSnapshot(snapshot, now = new Date(), options = {}) {
+  const cfg = { ...RULE_DEFAULTS, ...options };
+  const m = snapshot?.metrics || {};
+
+  const soc = typeof m.soc === "number" ? m.soc : null;
+  const solar = typeof m.solar_power === "number" ? m.solar_power : null;
+  const load = typeof m.load_power === "number" ? m.load_power : null;
+  const batteryPower = typeof m.battery_power === "number" ? m.battery_power : null;
+
+  const reserve = currentReserveSoc(now, cfg);
+
+  // If vehicle is unavailable, play it safe and stop charging.
+  if (snapshot?.vehicle?.unavailable) {
+    return {
+      action: "charge_stop",
+      targetAmps: null,
+      reserveSoc: reserve,
+      surplusW: null,
+      reason: "Vehicle unavailable; issuing charge_stop to be safe.",
+    };
+  }
+
+  // If we are missing critical telemetry, choose safe default: stop charging.
+  if (soc == null || solar == null || load == null || batteryPower == null) {
+    return {
+      action: "charge_stop",
+      targetAmps: null,
+      reserveSoc: reserve,
+      surplusW: null,
+      reason: "Missing critical telemetry (SOC/solar/load/battery); issuing charge_stop.",
+    };
+  }
+
+  const surplusW = Math.max(0, solar - load);
+
+  // Rule 1: Protect Powerwall reserve SOC
+  if (soc < reserve) {
+    return {
+      action: "charge_stop",
+      targetAmps: null,
+      reserveSoc: reserve,
+      surplusW,
+      reason: `SOC ${soc}% is below reserve ${reserve}%; stopping EV charge.`,
+    };
+  }
+
+  // Rule 2: Do not allow EV to drain Powerwall (battery discharging)
+  // When batteryPower < 0, the Powerwall is discharging (providing power).
+  // This happens when solar production < house load, meaning there isn't enough
+  // solar to cover current energy use. The Powerwall is making up the shortfall.
+  // If we allowed EV charging in this situation, it would add more load and
+  // further drain the Powerwall, reducing the battery reserve we need for
+  // peak hours (4-9pm). Therefore, we stop EV charging to preserve the Powerwall.
+  if (batteryPower < 0) {
+    return {
+      action: "charge_stop",
+      targetAmps: null,
+      reserveSoc: reserve,
+      surplusW,
+      reason: `Battery power ${batteryPower}W < 0 (discharging); stopping EV charge to avoid draining Powerwall.`,
+    };
+  }
+
+  // Rule 3: Require meaningful solar surplus
+  if (surplusW < cfg.minSurplusWatts) {
+    return {
+      action: "charge_stop",
+      targetAmps: null,
+      reserveSoc: reserve,
+      surplusW,
+      reason: `Solar surplus ${surplusW}W is below minimum ${cfg.minSurplusWatts}W; stopping EV charge.`,
+    };
+  }
+
+  // Rule 4: Use surplus to set charging amps
+  const rawAmps = wattsToAmps(surplusW, cfg.voltage);
+  const targetAmps = Math.max(cfg.minAmps, Math.min(cfg.maxAmps, Math.round(rawAmps)));
+
+  return {
+    action: "set_amps",
+    targetAmps,
+    reserveSoc: reserve,
+    surplusW,
+    reason: `Using solar surplus ${surplusW}W (~${rawAmps.toFixed(
+      1
+    )}A) to set charging to ${targetAmps}A.`,
+  };
+}
+
+async function runChargingRuleOnce({ requestedVid, requestedSiteId, now = new Date(), options = {} }) {
+  if (!teslaApi.tokens) {
+    throw new Error("Not authenticated. Visit / to login with Tesla first.");
+  }
+
+  const snapshot = await buildLiveSnapshot({ requestedVid, requestedSiteId });
+  const decision = decideChargingActionFromSnapshot(snapshot, now, options);
+
+  let commandResult = null;
+
+  try {
+    if (decision.action === "charge_stop") {
+      const resp = await teslaApi.chargeStop(snapshot.vehicle.id);
+      const text = await resp.text();
+      let body;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = text;
+      }
+      commandResult = { ok: resp.ok, status: resp.status, body };
+    } else if (decision.action === "set_amps" && decision.targetAmps != null) {
+      const resp = await teslaApi.setChargingAmps(snapshot.vehicle.id, decision.targetAmps);
+      const text = await resp.text();
+      let body;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = text;
+      }
+      commandResult = {
+        ok: resp.ok,
+        status: resp.status,
+        requested_amps: decision.targetAmps,
+        body,
+      };
+    }
+  } catch (e) {
+    commandResult = { ok: false, error: String(e) };
+  }
+
+  console.log(
+    "[soc-tou-rule-engine]",
+    JSON.stringify(
+      {
+        vehicle_id: snapshot.vehicle.id,
+        energy_site_id: snapshot.energy_site.energy_site_id,
+        decision,
+        commandResult,
+      },
+      null,
+      2
+    )
+  );
+
+  return { snapshot, decision, commandResult };
+}
+
+// One-shot endpoint to exercise the rule engine manually.
+app.get("/rules/run-once", async (req, res) => {
+  try {
+    const requestedVid = req.query.vid || req.query.vehicleId;
+    const requestedSiteId = req.query.siteId || req.query.energy_site_id;
+    const { snapshot, decision, commandResult } = await runChargingRuleOnce({
+      requestedVid,
+      requestedSiteId,
+    });
+    res.json({ snapshot, decision, commandResult });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
   }
 });
 
