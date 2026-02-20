@@ -1,20 +1,37 @@
 /**
  * Tesla Fleet OAuth + Vehicles Viewer (Node.js / Express)
  *
- * What this does:
+ * OAuth Flow:
+ * 1. User visits / -> redirected to Tesla Fleet OAuth authorize endpoint
+ * 2. User authorizes -> Tesla redirects to /auth/callback with authorization code
+ * 3. Server exchanges code for access_token + refresh_token
+ * 4. Access token is a JWT containing scopes and user info
+ * 5. Refresh token is used to obtain new access tokens when they expire
+ *
+ * Required Scopes:
+ * - openid: OpenID Connect authentication
+ * - offline_access: Refresh token for long-lived sessions
+ * - vehicle_device_data: Read vehicle telemetry
+ * - vehicle_cmds: Send vehicle commands
+ * - vehicle_charging_cmds: Control EV charging
+ * - energy_device_data: Read energy site data (solar/Powerwall)
+ *
+ * Endpoints:
  * - GET /                  -> shows "Login with Tesla" until tokens exist, then lists vehicles
  * - GET /auth/callback     -> OAuth callback, exchanges code for tokens
+ * - GET /auth/token-info   -> Debug endpoint to inspect JWT token claims
  * - GET /vehicle/:vid      -> wakes vehicle if needed, then renders vehicle_data as HTML table
  * - GET /energy/:siteId/live -> returns energy site live status data
  * - GET /.well-known/appspecific/:filename -> serves public key file(s) for Tesla verification
  *
  * Notes:
- * - This is a straight port of your Flask example (in-memory token storage).
+ * - This uses in-memory token storage (single user, single session).
  * - For SaaS/real use, store tokens per-user in a DB and encrypt refresh tokens.
+ * - OAuth state is generated once at startup (for production, use per-session state).
  *
  * Setup:
- * 1) npm i express node-fetch dotenv
- * 2) Create .env (see template below)
+ * 1) npm i express node-fetch dotenv jsonwebtoken
+ * 2) Create .env with CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SCOPES
  * 3) node server.js
  * 4) If using ngrok: ngrok http 8080, set REDIRECT_URI to https://<ngrok>/auth/callback
  */
@@ -29,6 +46,7 @@ import dotenv from "dotenv";
 import crypto from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
+import jwt from "jsonwebtoken";
 
 dotenv.config();
 
@@ -44,6 +62,19 @@ const CLIENT_ID = process.env.CLIENT_ID || "9bf3e8c49c96-4d67-93fd-9a315163c7a6"
 const CLIENT_SECRET = process.env.CLIENT_SECRET || "ta-secret.l5ooh5vPYoBdeqeD";
 const REDIRECT_URI =
   process.env.REDIRECT_URI || "https://mouldiest-phillis-nonspurious.ngrok-free.dev/auth/callback";
+/**
+ * Tesla Fleet API OAuth Scopes
+ * 
+ * Required scopes for this application:
+ * - openid: OpenID Connect authentication
+ * - offline_access: Allows obtaining refresh tokens for long-lived sessions
+ * - vehicle_device_data: Read vehicle telemetry (battery level, charging state, etc.)
+ * - vehicle_cmds: Send vehicle commands (wake up, etc.)
+ * - vehicle_charging_cmds: Control EV charging (stop, set amps)
+ * - energy_device_data: Read energy site data (solar, Powerwall, grid status)
+ * 
+ * These scopes provide both vehicle and energy access as required.
+ */
 const SCOPES =
   process.env.SCOPES ||
   "openid offline_access vehicle_device_data vehicle_cmds vehicle_charging_cmds energy_device_data";
@@ -94,6 +125,8 @@ class TeslaAPI {
       throw new Error("No refresh_token available. Re-login.");
     }
 
+    console.log("[TeslaAPI] Refreshing access token...");
+
     const body = new URLSearchParams({
       grant_type: "refresh_token",
       client_id: this.clientId,
@@ -109,11 +142,19 @@ class TeslaAPI {
 
     const json = await resp.json();
     if (!resp.ok) {
+      console.error("[TeslaAPI] Token refresh failed:", resp.status, json);
       throw new Error(`Refresh failed: ${resp.status} ${JSON.stringify(json)}`);
     }
 
     json.obtained_at = Math.floor(Date.now() / 1000);
     this.tokens = { ...this.tokens, ...json };
+
+    // Log new token claims
+    if (json.access_token) {
+      const claims = decodeTokenClaims(json.access_token);
+      console.log("[TeslaAPI] Token refreshed successfully");
+      console.log("[TeslaAPI] New token expires at:", claims?.expiresAt || "unknown");
+    }
   }
 
   async ensureValid() {
@@ -230,6 +271,12 @@ class TeslaAPI {
     const json = await resp.json();
     return json?.response;
   }
+
+  async getEnergySiteInfo(energy_site_id) {
+    const resp = await this.apiGet(`/api/1/energy_sites/${energy_site_id}/site_info`);
+    const json = await resp.json();
+    return json?.response;
+  }
 }
 
 const teslaApi = new TeslaAPI({
@@ -258,9 +305,32 @@ app.get("/", async (req, res) => {
       const url = `${AUTH_BASE}/authorize?${params.toString()}`;
 
       res.type("html").send(`
-        <h1>Tesla Fleet</h1>
-        <p><a href="${url}">Login with Tesla</a></p>
-        <p style="color:#666;font-family:Arial">State (debug): ${teslaApi.state}</p>
+        <!doctype html>
+        <html>
+        <head>
+          <meta charset="utf-8" />
+          <title>Tesla Fleet OAuth</title>
+          <style>
+            body { font-family: Arial, sans-serif; max-width: 600px; margin: 2em auto; padding: 1em; }
+            h1 { color: #333; }
+            .info { background: #f0f0f0; padding: 1em; border-radius: 4px; margin: 1em 0; }
+            .info code { background: #fff; padding: 2px 4px; border-radius: 2px; }
+            a { color: #e31937; text-decoration: none; font-weight: bold; }
+            a:hover { text-decoration: underline; }
+          </style>
+        </head>
+        <body>
+          <h1>Tesla Fleet OAuth</h1>
+          <p><a href="${url}">Login with Tesla</a></p>
+          <div class="info">
+            <p><strong>OAuth Configuration:</strong></p>
+            <p>Redirect URI: <code>${REDIRECT_URI}</code></p>
+            <p>Scopes: <code>${SCOPES}</code></p>
+            <p>State (CSRF protection): <code>${teslaApi.state}</code></p>
+          </div>
+          <p><small>After login, visit <a href="/auth/token-info">/auth/token-info</a> to inspect token claims.</small></p>
+        </body>
+        </html>
       `);
       return;
     }
@@ -280,15 +350,45 @@ app.get("/", async (req, res) => {
     const siteHtml = sites
       .map(
         (s) =>
-          `<p>Site ID: ${s.id} - Energy Site ID: <a href="/energy/${s.energy_site_id}/live">${s.energy_site_id}</a></p>`
+          `<p>Site ID: ${s.id} - Energy Site ID: <a href="/energy/${s.energy_site_id}/live">${s.energy_site_id}</a> | <a href="/energy/${s.energy_site_id}/site_info">Site Info</a></p>`
       )
       .join("");
 
+    // Get token info for display
+    const tokenClaims = teslaApi.tokens?.access_token
+      ? decodeTokenClaims(teslaApi.tokens.access_token)
+      : null;
+    const tokenInfoHtml = tokenClaims
+      ? `
+        <div style="background:#e8f5e9;padding:1em;border-radius:4px;margin:1em 0;">
+          <p><strong>Authentication Status:</strong> ✓ Authenticated</p>
+          <p>Token expires: ${tokenClaims.expiresAt || "unknown"}</p>
+          <p>Scopes: <code>${tokenClaims.scopes?.join(", ") || "none"}</code></p>
+          <p><a href="/auth/token-info">View full token info</a></p>
+        </div>
+      `
+      : "";
+
     res.type("html").send(`
-      <h1>Your Vehicles</h1>
-      ${listHtml || "<p>No vehicles found.</p>"}
-      <h1>Energy Sites</h1>
-      ${siteHtml || "<p>No energy sites found.</p>"}
+      <!doctype html>
+      <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>Your Tesla Account</title>
+        <style>
+          body { font-family: Arial, sans-serif; max-width: 800px; margin: 2em auto; padding: 1em; }
+          h1 { color: #333; }
+          code { background: #f0f0f0; padding: 2px 4px; border-radius: 2px; }
+        </style>
+      </head>
+      <body>
+        ${tokenInfoHtml}
+        <h1>Your Vehicles</h1>
+        ${listHtml || "<p>No vehicles found.</p>"}
+        <h1>Energy Sites</h1>
+        ${siteHtml || "<p>No energy sites found.</p>"}
+      </body>
+      </html>
     `);
   } catch (e) {
     res.status(500).type("html").send(`<h1>Error</h1><pre>${escapeHtml(String(e))}</pre>`);
@@ -345,6 +445,28 @@ app.get("/auth/callback", async (req, res) => {
 
     tokenJson.obtained_at = Math.floor(Date.now() / 1000);
     teslaApi.tokens = { ...(teslaApi.tokens || {}), ...tokenJson };
+
+    // Decode and log token claims for debugging
+    if (tokenJson.access_token) {
+      const claims = decodeTokenClaims(tokenJson.access_token);
+      console.log("[auth/callback] Token obtained successfully");
+      console.log("[auth/callback] Token claims:", JSON.stringify(claims, null, 2));
+      
+      // Verify required scopes are present
+      if (claims?.scopes) {
+        const requiredScopes = ["vehicle_device_data", "vehicle_cmds", "vehicle_charging_cmds", "energy_device_data"];
+        const missingScopes = requiredScopes.filter(
+          (scope) => !claims.scopes.includes(scope)
+        );
+        if (missingScopes.length > 0) {
+          console.warn(
+            `[auth/callback] WARNING: Missing scopes: ${missingScopes.join(", ")}`
+          );
+        } else {
+          console.log("[auth/callback] All required scopes present ✓");
+        }
+      }
+    }
 
     return res.redirect("/");
   } catch (e) {
@@ -452,6 +574,45 @@ app.get("/energy/:siteId/live", async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
+});
+
+app.get("/energy/:siteId/site_info", async (req, res) => {
+  try {
+    const data = await teslaApi.getEnergySiteInfo(req.params.siteId);
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+/**
+ * Debug endpoint to inspect current access token claims
+ * GET /auth/token-info
+ * 
+ * Returns JWT header, payload, scopes, expiration, and other useful info
+ */
+app.get("/auth/token-info", (req, res) => {
+  if (!teslaApi.tokens?.access_token) {
+    return res.status(401).json({
+      error: "Not authenticated",
+      message: "Visit / to login with Tesla first",
+    });
+  }
+
+  const claims = decodeTokenClaims(teslaApi.tokens.access_token);
+  const now = Math.floor(Date.now() / 1000);
+  const expiresAt = teslaApi.tokens.obtained_at + teslaApi.tokens.expires_in;
+  const expiresIn = expiresAt - now;
+
+  res.json({
+    hasToken: true,
+    tokenExpiresIn: expiresIn,
+    tokenExpiresAt: new Date(expiresAt * 1000).toISOString(),
+    tokenObtainedAt: new Date(teslaApi.tokens.obtained_at * 1000).toISOString(),
+    tokenValid: teslaApi.valid(),
+    claims,
+    configuredScopes: SCOPES.split(" "),
+  });
 });
 
 app.get("/vehicle/:vid/stop", async (req, res) => {
@@ -789,6 +950,45 @@ app.get("/rules/run-once", async (req, res) => {
     res.status(500).json({ error: String(e) });
   }
 });
+
+// ============================================================================
+// JWT Token Decoding
+// ============================================================================
+
+/**
+ * Decode and inspect JWT access token claims (without verification)
+ * Useful for debugging and confirming scopes/permissions
+ */
+function decodeTokenClaims(accessToken) {
+  if (!accessToken || typeof accessToken !== "string") {
+    return null;
+  }
+
+  try {
+    // Decode without verification (we just want to inspect claims)
+    const decoded = jwt.decode(accessToken, { complete: true });
+    if (!decoded) {
+      return null;
+    }
+
+    return {
+      header: decoded.header,
+      payload: decoded.payload,
+      // Extract useful fields
+      scopes: decoded.payload?.scope?.split(" ") || [],
+      expiresAt: decoded.payload?.exp
+        ? new Date(decoded.payload.exp * 1000).toISOString()
+        : null,
+      issuedAt: decoded.payload?.iat
+        ? new Date(decoded.payload.iat * 1000).toISOString()
+        : null,
+      subject: decoded.payload?.sub || null,
+    };
+  } catch (e) {
+    console.error("[decodeTokenClaims] Error:", e);
+    return { error: String(e) };
+  }
+}
 
 // ============================================================================
 // Helper Functions
