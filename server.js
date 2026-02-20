@@ -40,7 +40,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 8080);
-const CLIENT_ID = process.env.CLIENT_ID || "9bf3e8c49c96-4d67-93fd-9a315163c7a6-tesla-client-id";
+const CLIENT_ID = process.env.CLIENT_ID || "9bf3e8c49c96-4d67-93fd-9a315163c7a6";
 const CLIENT_SECRET = process.env.CLIENT_SECRET || "ta-secret.l5ooh5vPYoBdeqeD";
 const REDIRECT_URI =
   process.env.REDIRECT_URI || "https://mouldiest-phillis-nonspurious.ngrok-free.dev/auth/callback";
@@ -130,12 +130,15 @@ class TeslaAPI {
     return resp;
   }
 
-  async apiPost(pathname) {
+  async apiPost(pathname, body) {
     await this.ensureValid();
-    const resp = await fetch(`${API_BASE}${pathname}`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${this.tokens.access_token}` },
-    });
+    const headers = { Authorization: `Bearer ${this.tokens.access_token}` };
+    const options = { method: "POST", headers };
+    if (body !== undefined) {
+      headers["Content-Type"] = "application/json";
+      options.body = JSON.stringify(body);
+    }
+    const resp = await fetch(`${API_BASE}${pathname}`, options);
     return resp;
   }
 
@@ -162,6 +165,17 @@ class TeslaAPI {
 
   async getVehicleData(vid) {
     return this.apiGet(`/api/1/vehicles/${vid}/vehicle_data`);
+  }
+
+  async chargeStop(vid) {
+    return this.apiPost(`/api/1/vehicles/${vid}/command/charge_stop`);
+  }
+
+  async setChargingAmps(vid, amps) {
+    const charging_amps = Number(amps);
+    return this.apiPost(`/api/1/vehicles/${vid}/command/set_charging_amps`, {
+      charging_amps,
+    });
   }
 
   // Energy site methods
@@ -401,6 +415,59 @@ app.get("/energy/:siteId/live", async (req, res) => {
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: String(e) });
+  }
+});
+
+app.get("/vehicle/:vid/stop", async (req, res) => {
+  const vid = req.params.vid;
+  try {
+    const resp = await teslaApi.chargeStop(vid);
+    const text = await resp.text();
+    let body;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = text;
+    }
+    res.status(resp.ok ? 200 : resp.status).json({
+      ok: resp.ok,
+      status: resp.status,
+      body,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.get("/vehicle/:vid/set_amps/:amps", async (req, res) => {
+  const vid = req.params.vid;
+  const rawAmps = Number(req.params.amps);
+  if (!Number.isFinite(rawAmps)) {
+    return res.status(400).json({ ok: false, error: "Invalid amps value" });
+  }
+
+  const minAmps = 5;
+  const maxAmps = 32;
+  const targetAmps = Math.max(minAmps, Math.min(maxAmps, Math.round(rawAmps)));
+
+  try {
+    const resp = await teslaApi.setChargingAmps(vid, targetAmps);
+    const text = await resp.text();
+    let body;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = text;
+    }
+    res.status(resp.ok ? 200 : resp.status).json({
+      ok: resp.ok,
+      status: resp.status,
+      requested_amps: rawAmps,
+      applied_amps: targetAmps,
+      body,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
