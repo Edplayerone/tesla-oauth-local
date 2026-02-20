@@ -971,11 +971,19 @@ function decodeTokenClaims(accessToken) {
       return null;
     }
 
+    // Extract scopes - Tesla uses 'scp' (array) in JWT payload, fallback to 'scope' (string)
+    const scopesArray =
+      Array.isArray(decoded.payload?.scp)
+        ? decoded.payload.scp
+        : decoded.payload?.scope
+          ? decoded.payload.scope.split(" ")
+          : [];
+
     return {
       header: decoded.header,
       payload: decoded.payload,
       // Extract useful fields
-      scopes: decoded.payload?.scope?.split(" ") || [],
+      scopes: scopesArray,
       expiresAt: decoded.payload?.exp
         ? new Date(decoded.payload.exp * 1000).toISOString()
         : null,
