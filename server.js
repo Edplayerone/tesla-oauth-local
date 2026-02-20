@@ -167,6 +167,38 @@ class TeslaAPI {
     return this.apiGet(`/api/1/vehicles/${vid}/vehicle_data`);
   }
 
+  async getVehicleDataJson(vid) {
+    const resp = await this.getVehicleData(vid);
+    const text = await resp.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error(`Error parsing vehicle_data JSON: ${text.slice(0, 500)}`);
+    }
+    if (!resp.ok) {
+      const error = json?.error || "";
+      const isUnavailable =
+        resp.status === 408 ||
+        (typeof error === "string" && error.toLowerCase().includes("vehicle unavailable"));
+
+      if (isUnavailable) {
+        return {
+          _unavailable: {
+            status: resp.status,
+            error,
+            error_description: json?.error_description ?? "",
+          },
+        };
+      }
+
+      throw new Error(
+        `vehicle_data failed with status ${resp.status}: ${JSON.stringify(json).slice(0, 500)}`
+      );
+    }
+    return json?.response || null;
+  }
+
   async chargeStop(vid) {
     return this.apiPost(`/api/1/vehicles/${vid}/command/charge_stop`);
   }
@@ -183,7 +215,11 @@ class TeslaAPI {
     const resp = await this.apiGet("/api/1/products");
     try {
       const json = await resp.json();
-      return json?.response.filter((s) => s.device_type === "energy") || [];
+      return (
+        json?.response.filter(
+          (s) => s.device_type === "energy" && s.resource_type === "battery"
+        ) || []
+      );
     } catch {
       return [];
     }
@@ -436,6 +472,91 @@ app.get("/vehicle/:vid/stop", async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+app.get("/debug/live", async (req, res) => {
+  if (!teslaApi.tokens) {
+    return res.status(401).json({ error: "Not authenticated. Visit / to login with Tesla first." });
+  }
+
+  try {
+    const [vehicles, sites] = await Promise.all([
+      teslaApi.getVehicles(),
+      teslaApi.getEnergySites(),
+    ]);
+
+    if (!vehicles.length) {
+      return res.status(400).json({ error: "No vehicles found for this account." });
+    }
+
+    if (!sites.length) {
+      return res
+        .status(400)
+        .json({ error: "No energy sites with resource_type=battery found for this account." });
+    }
+
+    const requestedVid = req.query.vid || req.query.vehicleId;
+    const requestedSiteId = req.query.siteId || req.query.energy_site_id;
+
+    const vehicle =
+      (requestedVid &&
+        vehicles.find((v) => String(v.id) === String(requestedVid) || String(v.vin) === String(requestedVid))) ||
+      vehicles[0];
+
+    const site =
+      (requestedSiteId &&
+        sites.find(
+          (s) =>
+            String(s.id) === String(requestedSiteId) ||
+            String(s.energy_site_id) === String(requestedSiteId)
+        )) ||
+      sites[0];
+
+    const [energyLive, vehicleInfo] = await Promise.all([
+      teslaApi.getEnergyLiveStatus(site.energy_site_id),
+      teslaApi.getVehicleDataJson(vehicle.id),
+    ]);
+
+    const vehicleUnavailable =
+      vehicleInfo && typeof vehicleInfo === "object" && "_unavailable" in vehicleInfo
+        ? vehicleInfo._unavailable
+        : null;
+
+    const chargeState =
+      !vehicleUnavailable && vehicleInfo && typeof vehicleInfo === "object"
+        ? vehicleInfo.charge_state || {}
+        : {};
+
+    const snapshot = {
+      vehicle: {
+        id: vehicle.id,
+        vin: vehicle.vin,
+        display_name: vehicle.display_name,
+        unavailable: vehicleUnavailable,
+      },
+      energy_site: {
+        id: site.id,
+        energy_site_id: site.energy_site_id,
+        site_name: site.site_name,
+      },
+      metrics: {
+        soc: chargeState.battery_level ?? null,
+        solar_power: energyLive?.solar_power ?? null,
+        load_power: energyLive?.load_power ?? null,
+        battery_power: energyLive?.battery_power ?? null,
+        grid_power: energyLive?.grid_power ?? null,
+        percentage_charged: energyLive?.percentage_charged ?? null,
+        charging_state: chargeState.charging_state ?? null,
+        charger_power: chargeState.charger_power ?? null,
+        charger_actual_current: chargeState.charger_actual_current ?? null,
+        charger_voltage: chargeState.charger_voltage ?? null,
+      },
+    };
+
+    res.json(snapshot);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
   }
 });
 
