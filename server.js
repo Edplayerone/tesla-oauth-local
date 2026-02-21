@@ -47,6 +47,11 @@ import crypto from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 import jwt from "jsonwebtoken";
+import {
+  RULE_DEFAULTS,
+  currentReserveSoc,
+  decideChargingActionFromSnapshot,
+} from "./ruleEngine.js";
 
 dotenv.config();
 
@@ -58,6 +63,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 8080);
+const WEATHER_LAT = process.env.WEATHER_LAT || "37.77";
+const WEATHER_LON = process.env.WEATHER_LON || "-122.42";
 const CLIENT_ID = process.env.CLIENT_ID || "9bf3e8c49c96-4d67-93fd-9a315163c7a6";
 const CLIENT_SECRET = process.env.CLIENT_SECRET || "ta-secret.l5ooh5vPYoBdeqeD";
 const REDIRECT_URI =
@@ -77,7 +84,7 @@ const REDIRECT_URI =
  */
 const SCOPES =
   process.env.SCOPES ||
-  "openid offline_access vehicle_device_data vehicle_cmds vehicle_charging_cmds energy_device_data";
+  "openid offline_access vehicle_device_data vehicle_cmds vehicle_charging_cmds energy_device_data energy_cmds";
 
 // Tesla API endpoints
 const AUTH_BASE = "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3";
@@ -92,6 +99,7 @@ const STATE = crypto.randomBytes(32).toString("base64url");
 
 const app = express();
 
+app.use(express.json());
 app.use(
   "/.well-known/appspecific",
   express.static(path.join(process.cwd(), ".well-known", "appspecific"))
@@ -244,6 +252,11 @@ class TeslaAPI {
     return this.apiPost(`/api/1/vehicles/${vid}/command/charge_stop`);
   }
 
+  /** POST /api/1/vehicles/{id|vin}/command/charge_start */
+  async chargeStart(vid) {
+    return this.apiPost(`/api/1/vehicles/${vid}/command/charge_start`);
+  }
+
   async setChargingAmps(vid, amps) {
     const charging_amps = Number(amps);
     return this.apiPost(`/api/1/vehicles/${vid}/command/set_charging_amps`, {
@@ -277,6 +290,17 @@ class TeslaAPI {
     const json = await resp.json();
     return json?.response;
   }
+
+  /**
+   * Set energy site mode (requires energy_cmds scope).
+   * POST /api/1/energy_sites/{id}/operation
+   * @param {string} energy_site_id
+   * @param {'autonomous'|'self_consumption'} mode - autonomous = Time-Based (TOU), self_consumption = Self-Powered
+   */
+  async setEnergySiteOperation(energy_site_id, mode) {
+    const body = { default_real_mode: mode };
+    return this.apiPost(`/api/1/energy_sites/${energy_site_id}/operation`, body);
+  }
 }
 
 const teslaApi = new TeslaAPI({
@@ -290,6 +314,55 @@ const teslaApi = new TeslaAPI({
 // ============================================================================
 // Routes
 // ============================================================================
+
+// Public landing page (no auth) for early beta & marketing
+app.get("/landing", (req, res) => {
+  res.type("html").send(`
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tesla Solar Match — Protect your Powerwall, match EV to solar</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; line-height: 1.6; color: #333; background: #f5f5f5; }
+    .container { max-width: 640px; margin: 0 auto; padding: 2rem 1rem; }
+    h1 { font-size: 1.75rem; color: #e31937; margin-bottom: 1rem; }
+    h2 { font-size: 1.2rem; color: #555; margin: 1.5rem 0 0.75rem; }
+    p { margin-bottom: 1rem; }
+    .card { background: #fff; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 2px 4px rgba(0,0,0,0.08); }
+    .promise { font-size: 1.1rem; font-weight: 600; color: #1b5e20; background: #e8f5e9; padding: 1rem; border-radius: 6px; margin: 1rem 0; }
+    .cta { display: inline-block; background: #e31937; color: #fff; padding: 0.75rem 1.5rem; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 0.5rem; }
+    .cta:hover { opacity: 0.9; }
+    .demo-note { font-size: 0.9rem; color: #666; margin-top: 1rem; }
+    .footer { margin-top: 2rem; font-size: 0.85rem; color: #666; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h1>⚡ Tesla Solar Match</h1>
+      <p><strong>The problem:</strong> With Tesla Solar + Powerwall + an EV, your car can drain the battery before peak (4–9pm), or you export solar at low value. You end up buying expensive grid power when you wanted to run on stored solar.</p>
+      <p class="promise">Protect your Powerwall and match EV charging to real solar surplus.</p>
+      <p>This app uses Tesla Fleet API to read live solar, load, and Powerwall SOC, then automatically stops or throttles your EV charging so you keep enough reserve for peak and only charge the car when there’s real surplus.</p>
+    </div>
+    <div class="card">
+      <h2>See it in action</h2>
+      <p>Dashboard shows live SOC, solar, load, and last action (e.g. “Solar surplus 2.2kW → charging at 9A”). Toggle automation on/off and adjust reserves.</p>
+      <p class="demo-note">Demo: <a href="/">Log in with Tesla</a> → open Dashboard. (You’ll need a Tesla account with Powerwall + vehicle linked.)</p>
+    </div>
+    <div class="card">
+      <h2>Closed beta</h2>
+      <p>We’re looking for 3–5 Powerwall + Tesla vehicle owners to try this for a few weeks and give feedback.</p>
+      <a href="/" class="cta">Log in with Tesla → Try the dashboard</a>
+    </div>
+    <p class="footer">Post in r/TeslaSolar or Tesla Motors Club to offer early access. Onboard beta users via OAuth; set their vehicle/site and reserves manually at first.</p>
+  </div>
+</body>
+</html>
+  `);
+});
 
 app.get("/", async (req, res) => {
   try {
@@ -322,6 +395,7 @@ app.get("/", async (req, res) => {
         <body>
           <h1>Tesla Fleet OAuth</h1>
           <p><a href="${url}">Login with Tesla</a></p>
+          <p><small><a href="/landing">What is this? (Landing page)</a></small></p>
           <div class="info">
             <p><strong>OAuth Configuration:</strong></p>
             <p>Redirect URI: <code>${REDIRECT_URI}</code></p>
@@ -585,6 +659,35 @@ app.get("/energy/:siteId/site_info", async (req, res) => {
   }
 });
 
+app.post("/energy/:siteId/operation", async (req, res) => {
+  const siteId = req.params.siteId;
+  const mode = req.body?.mode;
+  if (mode !== "autonomous" && mode !== "self_consumption") {
+    return res.status(400).json({
+      error: "Invalid or missing mode",
+      required: "mode must be 'autonomous' (Time-Based/TOU) or 'self_consumption' (Self-Powered)",
+    });
+  }
+  try {
+    const resp = await teslaApi.setEnergySiteOperation(siteId, mode);
+    const text = await resp.text();
+    let body;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = text;
+    }
+    res.status(resp.ok ? 200 : resp.status).json({
+      ok: resp.ok,
+      status: resp.status,
+      mode,
+      body,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
 /**
  * Debug endpoint to inspect current access token claims
  * GET /auth/token-info
@@ -635,6 +738,30 @@ app.get("/vehicle/:vid/stop", async (req, res) => {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
+
+async function handleChargeStart(req, res) {
+  const vid = req.params.vid;
+  try {
+    const resp = await teslaApi.chargeStart(vid);
+    const text = await resp.text();
+    let body;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = text;
+    }
+    res.status(resp.ok ? 200 : resp.status).json({
+      ok: resp.ok,
+      status: resp.status,
+      body,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+}
+
+app.get("/vehicle/:vid/charge_start", handleChargeStart);
+app.post("/vehicle/:vid/charge_start", handleChargeStart);
 
 // ============================================================================
 // Live Snapshot Helper (shared by debug + rule engine)
@@ -705,6 +832,7 @@ async function buildLiveSnapshot({ requestedVid, requestedSiteId }) {
       grid_power: energyLive?.grid_power ?? null,
       percentage_charged: energyLive?.percentage_charged ?? null,
       charging_state: chargeState.charging_state ?? null,
+      charge_amps: chargeState.charge_amps ?? null,
       charger_power: chargeState.charger_power ?? null,
       charger_actual_current: chargeState.charger_actual_current ?? null,
       charger_voltage: chargeState.charger_voltage ?? null,
@@ -760,123 +888,7 @@ app.get("/vehicle/:vid/set_amps/:amps", async (req, res) => {
   }
 });
 
-// ============================================================================
-// SOC + TOU Rule Engine
-// ============================================================================
-
-const RULE_DEFAULTS = {
-  reserveOffPeak: 40,
-  reservePeak: 70,
-  peakStartHour: 16,
-  peakEndHour: 21,
-  minAmps: 5,
-  maxAmps: 32,
-  minSurplusWatts: 500,
-  voltage: 240,
-};
-
-function currentReserveSoc(now = new Date(), options = {}) {
-  const cfg = { ...RULE_DEFAULTS, ...options };
-  const hour = now.getHours();
-  const inPeak = hour >= cfg.peakStartHour && hour < cfg.peakEndHour;
-  return inPeak ? cfg.reservePeak : cfg.reserveOffPeak;
-}
-
-function wattsToAmps(surplusW, voltage) {
-  if (!Number.isFinite(surplusW) || !Number.isFinite(voltage) || voltage <= 0) {
-    return 0;
-  }
-  return surplusW / voltage;
-}
-
-function decideChargingActionFromSnapshot(snapshot, now = new Date(), options = {}) {
-  const cfg = { ...RULE_DEFAULTS, ...options };
-  const m = snapshot?.metrics || {};
-
-  const soc = typeof m.soc === "number" ? m.soc : null;
-  const solar = typeof m.solar_power === "number" ? m.solar_power : null;
-  const load = typeof m.load_power === "number" ? m.load_power : null;
-  const batteryPower = typeof m.battery_power === "number" ? m.battery_power : null;
-
-  const reserve = currentReserveSoc(now, cfg);
-
-  // If vehicle is unavailable, play it safe and stop charging.
-  if (snapshot?.vehicle?.unavailable) {
-    return {
-      action: "charge_stop",
-      targetAmps: null,
-      reserveSoc: reserve,
-      surplusW: null,
-      reason: "Vehicle unavailable; issuing charge_stop to be safe.",
-    };
-  }
-
-  // If we are missing critical telemetry, choose safe default: stop charging.
-  if (soc == null || solar == null || load == null || batteryPower == null) {
-    return {
-      action: "charge_stop",
-      targetAmps: null,
-      reserveSoc: reserve,
-      surplusW: null,
-      reason: "Missing critical telemetry (SOC/solar/load/battery); issuing charge_stop.",
-    };
-  }
-
-  const surplusW = Math.max(0, solar - load);
-
-  // Rule 1: Protect Powerwall reserve SOC
-  if (soc < reserve) {
-    return {
-      action: "charge_stop",
-      targetAmps: null,
-      reserveSoc: reserve,
-      surplusW,
-      reason: `SOC ${soc}% is below reserve ${reserve}%; stopping EV charge.`,
-    };
-  }
-
-  // Rule 2: Do not allow EV to drain Powerwall (battery discharging)
-  // When batteryPower < 0, the Powerwall is discharging (providing power).
-  // This happens when solar production < house load, meaning there isn't enough
-  // solar to cover current energy use. The Powerwall is making up the shortfall.
-  // If we allowed EV charging in this situation, it would add more load and
-  // further drain the Powerwall, reducing the battery reserve we need for
-  // peak hours (4-9pm). Therefore, we stop EV charging to preserve the Powerwall.
-  if (batteryPower < 0) {
-    return {
-      action: "charge_stop",
-      targetAmps: null,
-      reserveSoc: reserve,
-      surplusW,
-      reason: `Battery power ${batteryPower}W < 0 (discharging); stopping EV charge to avoid draining Powerwall.`,
-    };
-  }
-
-  // Rule 3: Require meaningful solar surplus
-  if (surplusW < cfg.minSurplusWatts) {
-    return {
-      action: "charge_stop",
-      targetAmps: null,
-      reserveSoc: reserve,
-      surplusW,
-      reason: `Solar surplus ${surplusW}W is below minimum ${cfg.minSurplusWatts}W; stopping EV charge.`,
-    };
-  }
-
-  // Rule 4: Use surplus to set charging amps
-  const rawAmps = wattsToAmps(surplusW, cfg.voltage);
-  const targetAmps = Math.max(cfg.minAmps, Math.min(cfg.maxAmps, Math.round(rawAmps)));
-
-  return {
-    action: "set_amps",
-    targetAmps,
-    reserveSoc: reserve,
-    surplusW,
-    reason: `Using solar surplus ${surplusW}W (~${rawAmps.toFixed(
-      1
-    )}A) to set charging to ${targetAmps}A.`,
-  };
-}
+// Rule engine is in ruleEngine.js (decideChargingActionFromSnapshot, RULE_DEFAULTS, currentReserveSoc).
 
 async function runChargingRuleOnce({ requestedVid, requestedSiteId, now = new Date(), options = {} }) {
   if (!teslaApi.tokens) {
@@ -900,20 +912,47 @@ async function runChargingRuleOnce({ requestedVid, requestedSiteId, now = new Da
       }
       commandResult = { ok: resp.ok, status: resp.status, body };
     } else if (decision.action === "set_amps" && decision.targetAmps != null) {
-      const resp = await teslaApi.setChargingAmps(snapshot.vehicle.id, decision.targetAmps);
-      const text = await resp.text();
-      let body;
-      try {
-        body = JSON.parse(text);
-      } catch {
-        body = text;
+      const chargingState = snapshot?.metrics?.charging_state ?? "";
+      if (String(chargingState) !== "Charging") {
+        const startResp = await teslaApi.chargeStart(snapshot.vehicle.id);
+        const startOk = startResp.ok;
+        if (!startOk) {
+          const startText = await startResp.text();
+          commandResult = { ok: false, error: `charge_start failed: ${startText}` };
+        } else {
+          await new Promise((r) => setTimeout(r, 1500));
+          const resp = await teslaApi.setChargingAmps(snapshot.vehicle.id, decision.targetAmps);
+          const text = await resp.text();
+          let body;
+          try {
+            body = JSON.parse(text);
+          } catch {
+            body = text;
+          }
+          commandResult = {
+            ok: resp.ok,
+            status: resp.status,
+            requested_amps: decision.targetAmps,
+            body,
+            charge_started: true,
+          };
+        }
+      } else {
+        const resp = await teslaApi.setChargingAmps(snapshot.vehicle.id, decision.targetAmps);
+        const text = await resp.text();
+        let body;
+        try {
+          body = JSON.parse(text);
+        } catch {
+          body = text;
+        }
+        commandResult = {
+          ok: resp.ok,
+          status: resp.status,
+          requested_amps: decision.targetAmps,
+          body,
+        };
       }
-      commandResult = {
-        ok: resp.ok,
-        status: resp.status,
-        requested_amps: decision.targetAmps,
-        body,
-      };
     }
   } catch (e) {
     commandResult = { ok: false, error: String(e) };
@@ -1032,10 +1071,772 @@ function renderDict(obj, parentKey = "") {
 }
 
 // ============================================================================
+// Scheduler + Rule State Management
+// ============================================================================
+
+/**
+ * In-memory rule state (for MVP - later move to DB)
+ * Tracks enabled state, vehicle/site IDs, reserve settings, and last action
+ */
+const rule = {
+  enabled: false,
+  vehicleId: null,
+  siteId: null,
+  reserveOffPeak: RULE_DEFAULTS.reserveOffPeak,
+  reservePeak: RULE_DEFAULTS.reservePeak,
+  lastAmps: null,
+  lastCommandAt: 0,
+  lastAction: "none",
+  lastReason: "",
+  lastRunAt: 0,
+  lastSnapshot: null,
+  lastDecision: null,
+  lastCommandResult: null,
+  errorCount: 0,
+  lastError: null,
+};
+
+/**
+ * Scheduler loop: runs every 60 seconds when rule.enabled is true
+ * Applies SOC + TOU rules with guardrails (deadband, throttle, error handling)
+ */
+let schedulerInterval = null;
+
+async function schedulerLoop() {
+  if (!rule.enabled || !teslaApi.tokens) {
+    return;
+  }
+
+  const now = Date.now();
+  rule.lastRunAt = now;
+
+  try {
+    // Build live snapshot
+    const snapshot = await buildLiveSnapshot({
+      requestedVid: rule.vehicleId,
+      requestedSiteId: rule.siteId,
+    });
+
+    // Decide action using rule engine
+    const decision = decideChargingActionFromSnapshot(snapshot, new Date(), {
+      reserveOffPeak: rule.reserveOffPeak,
+      reservePeak: rule.reservePeak,
+      peakStartHour: RULE_DEFAULTS.peakStartHour,
+      peakEndHour: RULE_DEFAULTS.peakEndHour,
+      minAmps: RULE_DEFAULTS.minAmps,
+      maxAmps: RULE_DEFAULTS.maxAmps,
+      minSurplusWatts: RULE_DEFAULTS.minSurplusWatts,
+      minSolarWatts: RULE_DEFAULTS.minSolarWatts,
+      solarHoursStart: RULE_DEFAULTS.solarHoursStart,
+      solarHoursEnd: RULE_DEFAULTS.solarHoursEnd,
+      voltage: RULE_DEFAULTS.voltage,
+    });
+
+    rule.lastSnapshot = snapshot;
+    rule.lastDecision = decision;
+
+    // Guardrail 1: Command throttle - don't send commands more than once per minute
+    const timeSinceLastCommand = now - rule.lastCommandAt;
+    const canSendCommand = timeSinceLastCommand >= 60_000;
+
+    if (!canSendCommand && decision.action === "set_amps") {
+      console.log(
+        `[scheduler] Skipping command (throttled): last command was ${Math.round(
+          timeSinceLastCommand / 1000
+        )}s ago`
+      );
+      rule.lastAction = "throttled";
+      rule.lastReason = decision.reason + " (throttled - waiting 60s between commands)";
+      return;
+    }
+
+    // Guardrail 2: Deadband for set_amps - only change if difference >= 2A
+    if (decision.action === "set_amps" && decision.targetAmps != null) {
+      if (rule.lastAmps != null && Math.abs(decision.targetAmps - rule.lastAmps) < 2) {
+        console.log(
+          `[scheduler] Skipping set_amps (deadband): target ${decision.targetAmps}A vs last ${rule.lastAmps}A (diff < 2A)`
+        );
+        rule.lastAction = "deadband";
+        rule.lastReason = decision.reason + " (deadband - change < 2A)";
+        return;
+      }
+    }
+
+    // Execute command
+    let commandResult = null;
+
+    if (decision.action === "charge_stop") {
+      const resp = await teslaApi.chargeStop(snapshot.vehicle.id);
+      const text = await resp.text();
+      let body;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = text;
+      }
+      commandResult = { ok: resp.ok, status: resp.status, body };
+      rule.lastAmps = null;
+    } else if (decision.action === "set_amps" && decision.targetAmps != null) {
+      const chargingState = snapshot?.metrics?.charging_state ?? "";
+      if (String(chargingState) !== "Charging") {
+        const startResp = await teslaApi.chargeStart(snapshot.vehicle.id);
+        if (!startResp.ok) {
+          const startText = await startResp.text();
+          commandResult = { ok: false, error: `charge_start failed: ${startText}` };
+          rule.lastAction = "error";
+          rule.lastReason = `Start charging failed: ${startText}`;
+          rule.lastCommandResult = commandResult;
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      const resp = await teslaApi.setChargingAmps(snapshot.vehicle.id, decision.targetAmps);
+      const text = await resp.text();
+      let body;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = text;
+      }
+      commandResult = {
+        ok: resp.ok,
+        status: resp.status,
+        requested_amps: decision.targetAmps,
+        body,
+      };
+      rule.lastAmps = decision.targetAmps;
+    }
+
+    rule.lastCommandAt = now;
+    rule.lastAction = decision.action;
+    rule.lastReason = decision.reason;
+    rule.lastCommandResult = commandResult;
+    rule.errorCount = 0;
+    rule.lastError = null;
+
+    console.log(
+      `[scheduler] ${decision.action}: ${decision.reason} | Command result: ${commandResult?.ok ? "OK" : "FAILED"}`
+    );
+  } catch (e) {
+    rule.errorCount++;
+    rule.lastError = String(e);
+    rule.lastAction = "error";
+    rule.lastReason = `Error: ${String(e)}`;
+    console.error(`[scheduler] Error in loop:`, e);
+  }
+}
+
+function startScheduler() {
+  if (schedulerInterval) {
+    return; // Already running
+  }
+  console.log("[scheduler] Starting 60s loop...");
+  schedulerInterval = setInterval(schedulerLoop, 60_000);
+  // Run once immediately
+  schedulerLoop();
+}
+
+function stopScheduler() {
+  if (schedulerInterval) {
+    clearInterval(schedulerInterval);
+    schedulerInterval = null;
+    console.log("[scheduler] Stopped");
+  }
+}
+
+// ============================================================================
+// Rule Management Endpoints
+// ============================================================================
+
+app.post("/rules/enable", async (req, res) => {
+  try {
+    const { vehicleId, siteId, reserveOffPeak, reservePeak } = req.body;
+
+    if (!vehicleId || !siteId) {
+      return res.status(400).json({
+        error: "Missing required fields",
+        required: ["vehicleId", "siteId"],
+      });
+    }
+
+    // Validate vehicle and site exist
+    const [vehicles, sites] = await Promise.all([
+      teslaApi.getVehicles(),
+      teslaApi.getEnergySites(),
+    ]);
+
+    const vehicle = vehicles.find(
+      (v) => String(v.id) === String(vehicleId) || String(v.vin) === String(vehicleId)
+    );
+    if (!vehicle) {
+      return res.status(404).json({ error: `Vehicle ${vehicleId} not found` });
+    }
+
+    const site = sites.find(
+      (s) =>
+        String(s.id) === String(siteId) ||
+        String(s.energy_site_id) === String(siteId)
+    );
+    if (!site) {
+      return res.status(404).json({ error: `Energy site ${siteId} not found` });
+    }
+
+    // Update rule state
+    rule.enabled = true;
+    rule.vehicleId = String(vehicle.id);
+    rule.siteId = String(site.energy_site_id);
+    if (typeof reserveOffPeak === "number" && reserveOffPeak >= 0 && reserveOffPeak <= 100) {
+      rule.reserveOffPeak = reserveOffPeak;
+    }
+    if (typeof reservePeak === "number" && reservePeak >= 0 && reservePeak <= 100) {
+      rule.reservePeak = reservePeak;
+    }
+
+    // Reset state
+    rule.lastAmps = null;
+    rule.lastCommandAt = 0;
+    rule.lastAction = "none";
+    rule.lastReason = "";
+    rule.errorCount = 0;
+    rule.lastError = null;
+
+    startScheduler();
+
+    res.json({
+      success: true,
+      rule: {
+        enabled: rule.enabled,
+        vehicleId: rule.vehicleId,
+        siteId: rule.siteId,
+        reserveOffPeak: rule.reserveOffPeak,
+        reservePeak: rule.reservePeak,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post("/rules/disable", (req, res) => {
+  rule.enabled = false;
+  stopScheduler();
+  res.json({
+    success: true,
+    message: "Rule disabled and scheduler stopped",
+    rule: {
+      enabled: rule.enabled,
+    },
+  });
+});
+
+app.get("/rules/status", async (req, res) => {
+  try {
+    const currentReserve = currentReserveSoc(new Date(), {
+      reserveOffPeak: rule.reserveOffPeak,
+      reservePeak: rule.reservePeak,
+      peakStartHour: RULE_DEFAULTS.peakStartHour,
+      peakEndHour: RULE_DEFAULTS.peakEndHour,
+    });
+
+    const status = {
+      rule: {
+        enabled: rule.enabled,
+        vehicleId: rule.vehicleId,
+        siteId: rule.siteId,
+        reserveOffPeak: rule.reserveOffPeak,
+        reservePeak: rule.reservePeak,
+        currentReserve,
+        lastAmps: rule.lastAmps,
+        lastAction: rule.lastAction,
+        lastReason: rule.lastReason,
+        lastRunAt: rule.lastRunAt ? new Date(rule.lastRunAt).toISOString() : null,
+        lastCommandAt: rule.lastCommandAt ? new Date(rule.lastCommandAt).toISOString() : null,
+        errorCount: rule.errorCount,
+        lastError: rule.lastError,
+      },
+      snapshot: rule.lastSnapshot,
+      decision: rule.lastDecision,
+      commandResult: rule.lastCommandResult,
+    };
+
+    res.json(status);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ============================================================================
+// Tomorrow's weather (for Self-Powered vs TOU recommendation)
+// ============================================================================
+
+const WEATHER_CACHE_MS = 60 * 60 * 1000; // 1 hour
+let weatherCache = { at: 0, data: null };
+
+/**
+ * Fetch tomorrow's weather from Open-Meteo (free, no API key).
+ * Returns { sunny, summary, recommendation } for NEM 3 strategy:
+ * - Sunny tomorrow → use Self-Powered overnight (drain battery; we'll recharge).
+ * - Rainy tomorrow → after peak, switch to TOU to conserve battery for the next day.
+ */
+async function getTomorrowWeather() {
+  if (weatherCache.data && Date.now() - weatherCache.at < WEATHER_CACHE_MS) {
+    return weatherCache.data;
+  }
+  try {
+    const url = new URL("https://api.open-meteo.com/v1/forecast");
+    url.searchParams.set("latitude", WEATHER_LAT);
+    url.searchParams.set("longitude", WEATHER_LON);
+    url.searchParams.set("daily", "weathercode,precipitation_probability_max");
+    url.searchParams.set("timezone", "America/Los_Angeles");
+    url.searchParams.set("forecast_days", "2");
+    const resp = await fetch(url.toString());
+    if (!resp.ok) return { sunny: null, summary: "Unknown", recommendation: "Check weather manually." };
+    const json = await resp.json();
+    const daily = json.daily;
+    if (!daily || !daily.time || daily.time.length < 2) return { sunny: null, summary: "Unknown", recommendation: "Check weather manually." };
+    const tomorrowCode = daily.weathercode[1];
+    const tomorrowPop = daily.precipitation_probability_max?.[1] ?? 0;
+    // WMO codes: 0 clear, 1-3 partly cloudy, 45-48 fog, 51-67 rain/drizzle, 71-77 snow, 80-82 showers, 95-99 thunder
+    const rainyCodes = (c) => (c >= 51 && c <= 67) || (c >= 71 && c <= 82) || (c >= 95 && c <= 99);
+    const sunny = !rainyCodes(tomorrowCode) && tomorrowPop < 50;
+    const summary = sunny ? "Sunny / clear" : rainyCodes(tomorrowCode) ? "Rain or precipitation" : "Cloudy / possible rain";
+    const recommendation = sunny
+      ? "Use Self-Powered overnight — tomorrow will recharge the battery."
+      : "After peak hours, switch to TOU to conserve battery for tomorrow.";
+    const data = { sunny, summary, recommendation, weathercode: tomorrowCode, pop: tomorrowPop };
+    weatherCache = { at: Date.now(), data };
+    return data;
+  } catch (e) {
+    console.error("[weather]", e);
+    return { sunny: null, summary: "Error", recommendation: "Check weather manually." };
+  }
+}
+
+app.get("/weather/tomorrow", async (req, res) => {
+  try {
+    const data = await getTomorrowWeather();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.get("/dashboard", async (req, res) => {
+  if (!teslaApi.tokens) {
+    return res.redirect("/");
+  }
+
+  try {
+    const tomorrowWeather = await getTomorrowWeather();
+
+    // Get current status
+    const currentReserve = currentReserveSoc(new Date(), {
+      reserveOffPeak: rule.reserveOffPeak,
+      reservePeak: rule.reservePeak,
+      peakStartHour: RULE_DEFAULTS.peakStartHour,
+      peakEndHour: RULE_DEFAULTS.peakEndHour,
+    });
+
+    const now = new Date();
+    const hour = now.getHours();
+    const inPeak = hour >= RULE_DEFAULTS.peakStartHour && hour < RULE_DEFAULTS.peakEndHour;
+
+    // Get latest snapshot (for display and for default vehicle/site when enabling rule)
+    let snapshot = rule.lastSnapshot;
+    if (!snapshot) {
+      try {
+        snapshot = await buildLiveSnapshot({
+          requestedVid: rule.vehicleId || undefined,
+          requestedSiteId: rule.siteId || undefined,
+        });
+      } catch (e) {
+        console.error("[dashboard] Error fetching snapshot:", e);
+      }
+    }
+
+    const defaultVehicleId = snapshot?.vehicle?.id ?? rule.vehicleId ?? "";
+    const defaultSiteId = snapshot?.energy_site?.energy_site_id ?? rule.siteId ?? "";
+
+    const m = snapshot?.metrics || {};
+    const soc = m.percentage_charged ?? m.soc ?? null;
+    const solarW = m.solar_power ?? null;
+    const loadW = m.load_power ?? null;
+    const batteryW = m.battery_power ?? null;
+    const gridW = m.grid_power ?? null;
+    const chargingState = m.charging_state ?? null;
+    const chargerAmps = m.charger_actual_current ?? null;
+
+    const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tesla Solar Match Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: #f5f5f5;
+      color: #333;
+      line-height: 1.6;
+      padding: 1rem;
+    }
+    .container {
+      max-width: 600px;
+      margin: 0 auto;
+    }
+    h1 {
+      font-size: 1.5rem;
+      margin-bottom: 1rem;
+      color: #e31937;
+    }
+    .card {
+      background: white;
+      border-radius: 8px;
+      padding: 1.5rem;
+      margin-bottom: 1rem;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .card h2 {
+      font-size: 1.1rem;
+      margin-bottom: 1rem;
+      color: #555;
+      border-bottom: 2px solid #e31937;
+      padding-bottom: 0.5rem;
+    }
+    .toggle-section {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1rem;
+    }
+    .toggle-btn {
+      padding: 0.75rem 1.5rem;
+      border: none;
+      border-radius: 6px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .toggle-btn.enabled {
+      background: #e31937;
+      color: white;
+    }
+    .toggle-btn.disabled {
+      background: #ccc;
+      color: #666;
+    }
+    .toggle-btn:hover {
+      opacity: 0.9;
+      transform: scale(1.02);
+    }
+    .status-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+    .stat {
+      text-align: center;
+    }
+    .stat-label {
+      font-size: 0.85rem;
+      color: #666;
+      margin-bottom: 0.25rem;
+    }
+    .stat-value {
+      font-size: 1.5rem;
+      font-weight: 600;
+      color: #333;
+    }
+    .stat-value.good { color: #4caf50; }
+    .stat-value.warning { color: #ff9800; }
+    .stat-value.danger { color: #f44336; }
+    .last-action {
+      background: #f9f9f9;
+      padding: 1rem;
+      border-radius: 6px;
+      margin-top: 1rem;
+      border-left: 4px solid #e31937;
+    }
+    .last-action-label {
+      font-size: 0.85rem;
+      color: #666;
+      margin-bottom: 0.5rem;
+    }
+    .last-action-reason {
+      font-size: 0.95rem;
+      color: #333;
+      line-height: 1.5;
+    }
+    .config-section {
+      margin-top: 1rem;
+    }
+    .config-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 0.75rem;
+    }
+    .config-label {
+      font-size: 0.9rem;
+      color: #666;
+    }
+    .config-value {
+      font-weight: 600;
+      color: #333;
+    }
+    .peak-badge {
+      display: inline-block;
+      padding: 0.25rem 0.75rem;
+      border-radius: 12px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      margin-left: 0.5rem;
+    }
+    .peak-badge.active {
+      background: #ff9800;
+      color: white;
+    }
+    .peak-badge.inactive {
+      background: #e0e0e0;
+      color: #666;
+    }
+    .error {
+      background: #ffebee;
+      color: #c62828;
+      padding: 1rem;
+      border-radius: 6px;
+      margin-top: 1rem;
+    }
+    .link {
+      color: #e31937;
+      text-decoration: none;
+      font-size: 0.9rem;
+    }
+    .link:hover { text-decoration: underline; }
+    @media (max-width: 480px) {
+      .status-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>⚡ Tesla Solar Match</h1>
+    <div class="poll-timer" style="text-align: center; margin-bottom: 1rem; font-size: 0.9rem; color: #666;">
+      Next refresh in <strong id="pollCountdown">30</strong>s
+    </div>
+
+    <div class="card">
+      <h2>Control</h2>
+      <div class="toggle-section">
+        <span>Automation Status:</span>
+        <button id="toggleBtn" class="toggle-btn ${rule.enabled ? "enabled" : "disabled"}" onclick="toggleRule()">
+          ${rule.enabled ? "ON" : "OFF"}
+        </button>
+      </div>
+      ${rule.enabled && rule.vehicleId && rule.siteId ? `
+        <div class="config-section">
+          <div class="config-row">
+            <span class="config-label">Vehicle ID:</span>
+            <span class="config-value">${escapeHtml(rule.vehicleId)}</span>
+          </div>
+          <div class="config-row">
+            <span class="config-label">Site ID:</span>
+            <span class="config-value">${escapeHtml(rule.siteId)}</span>
+          </div>
+        </div>
+      ` : `
+        <p style="color: #666; font-size: 0.9rem; margin-top: 1rem;">
+          Enable automation and configure vehicle/site via API: <code>POST /rules/enable</code>
+        </p>
+      `}
+    </div>
+
+    <div class="card">
+      <h2>Tomorrow's weather</h2>
+      <p style="font-size: 0.95rem; color: #555; margin-bottom: 0.5rem;">
+        <strong>${tomorrowWeather.summary}</strong>
+        ${tomorrowWeather.sunny === true ? " ☀️" : tomorrowWeather.sunny === false ? " 🌧️" : ""}
+      </p>
+      <p style="font-size: 0.9rem; color: #333; line-height: 1.5; padding: 0.75rem; background: #f5f5f5; border-radius: 6px;">
+        ${escapeHtml(tomorrowWeather.recommendation)}
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Powerwall Status</h2>
+      <div class="status-grid">
+        <div class="stat">
+          <div class="stat-label">SOC</div>
+          <div class="stat-value ${soc != null ? (soc < currentReserve ? "danger" : soc < currentReserve + 10 ? "warning" : "good") : ""}">
+            ${soc != null ? `${soc.toFixed(1)}%` : "—"}
+          </div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Reserve</div>
+          <div class="stat-value">
+            ${currentReserve}%
+            <span class="peak-badge ${inPeak ? "active" : "inactive"}">
+              ${inPeak ? "PEAK" : "OFF-PEAK"}
+            </span>
+          </div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Solar</div>
+          <div class="stat-value">${solarW != null ? `${(solarW / 1000).toFixed(2)} kW` : "—"}</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Load</div>
+          <div class="stat-value">${loadW != null ? `${(loadW / 1000).toFixed(2)} kW` : "—"}</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Battery</div>
+          <div class="stat-value ${batteryW != null ? (batteryW < 0 ? "good" : "danger") : ""}">
+            ${batteryW != null ? `${(batteryW / 1000).toFixed(2)} kW` : "—"}
+            ${batteryW != null ? (batteryW < 0 ? " (charging)" : batteryW > 0 ? " (discharging)" : "") : ""}
+          </div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Grid</div>
+          <div class="stat-value ${gridW != null ? (gridW > 0 ? "danger" : gridW < 0 ? "good" : "") : ""}">
+            ${gridW != null ? `${(gridW / 1000).toFixed(2)} kW` : "—"}
+            ${gridW != null ? (gridW > 0 ? " (importing)" : gridW < 0 ? " (exporting)" : "") : ""}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>EV Charging</h2>
+      <div class="status-grid">
+        <div class="stat">
+          <div class="stat-label">State</div>
+          <div class="stat-value">${chargingState ? escapeHtml(chargingState) : "—"}</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Current Amps</div>
+          <div class="stat-value">${chargerAmps != null ? `${chargerAmps}A` : "—"}</div>
+        </div>
+      </div>
+      ${rule.lastAmps != null ? `
+        <div style="margin-top: 1rem; padding: 0.75rem; background: #e8f5e9; border-radius: 6px;">
+          <strong>Last Set:</strong> ${rule.lastAmps}A
+        </div>
+      ` : ""}
+    </div>
+
+    <div class="card">
+      <h2>Last Action</h2>
+      <div class="last-action">
+        <div class="last-action-label">Action: <strong>${rule.lastAction || "none"}</strong></div>
+        <div class="last-action-reason">${rule.lastReason || "No actions taken yet."}</div>
+      </div>
+      ${rule.lastRunAt ? `
+        <div style="margin-top: 0.75rem; font-size: 0.85rem; color: #666;">
+          Last run: ${new Date(rule.lastRunAt).toLocaleString()}
+        </div>
+      ` : ""}
+      ${rule.errorCount > 0 ? `
+        <div class="error" style="margin-top: 1rem;">
+          <strong>Errors:</strong> ${rule.errorCount}
+          ${rule.lastError ? `<br><small>${escapeHtml(rule.lastError)}</small>` : ""}
+        </div>
+      ` : ""}
+    </div>
+
+    <div class="card">
+      <h2>Configuration</h2>
+      <div class="config-section">
+        <div class="config-row">
+          <span class="config-label">Off-Peak Reserve:</span>
+          <span class="config-value">${rule.reserveOffPeak}%</span>
+        </div>
+        <div class="config-row">
+          <span class="config-label">Peak Reserve:</span>
+          <span class="config-value">${rule.reservePeak}%</span>
+        </div>
+        <div class="config-row">
+          <span class="config-label">Peak Hours:</span>
+          <span class="config-value">${RULE_DEFAULTS.peakStartHour}:00 - ${RULE_DEFAULTS.peakEndHour}:00</span>
+        </div>
+      </div>
+    </div>
+
+    <div style="text-align: center; margin-top: 2rem; padding: 1rem;">
+      <a href="/" class="link">← Back to Account</a> |
+      <a href="/rules/status" class="link">JSON Status</a>
+    </div>
+  </div>
+
+  <script>
+    const RULE_CONFIG = {
+      vehicleId: ${JSON.stringify(rule.vehicleId || defaultVehicleId)},
+      siteId: ${JSON.stringify(rule.siteId || defaultSiteId)},
+    };
+
+    async function toggleRule() {
+      const btn = document.getElementById('toggleBtn');
+      const isEnabled = btn.classList.contains('enabled');
+      const vehicleId = RULE_CONFIG.vehicleId || '';
+      const siteId = RULE_CONFIG.siteId || '';
+      if (!isEnabled && (!vehicleId || !siteId)) {
+        alert('Cannot enable: no vehicle or energy site selected. Refresh the page to load defaults.');
+        return;
+      }
+
+      try {
+        const response = await fetch(isEnabled ? '/rules/disable' : '/rules/enable', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            vehicleId,
+            siteId,
+          }),
+        });
+
+        const data = await response.json();
+        if (data.success || data.error) {
+          setTimeout(() => window.location.reload(), 500);
+        } else if (!response.ok) {
+          alert(data.error || 'Request failed');
+        }
+      } catch (e) {
+        alert('Error toggling rule: ' + e.message);
+      }
+    }
+
+    // Polling: countdown timer and refresh every 30 seconds
+    const POLL_INTERVAL_SEC = 30;
+    let secondsLeft = POLL_INTERVAL_SEC;
+    const countdownEl = document.getElementById('pollCountdown');
+    const pollTimer = setInterval(() => {
+      secondsLeft--;
+      if (countdownEl) countdownEl.textContent = Math.max(0, secondsLeft);
+      if (secondsLeft <= 0) {
+        clearInterval(pollTimer);
+        window.location.reload();
+      }
+    }, 1000);
+  </script>
+</body>
+</html>`;
+
+    res.type("html").send(html);
+  } catch (e) {
+    res.status(500).type("html").send(`<h1>Error</h1><pre>${escapeHtml(String(e))}</pre>`);
+  }
+});
+
+// ============================================================================
 // Server Startup
 // ============================================================================
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
   console.log(`Open: http://localhost:${PORT}/ (or your ngrok URL)`);
+  console.log(`Dashboard: http://localhost:${PORT}/dashboard`);
 });

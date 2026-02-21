@@ -1,3 +1,7 @@
 /node_modules
 private-key.pem
 .env
+BETA.md
+DOGFOODING.md
+OAUTH.md
+POST-MVP-DECISIONS.md
